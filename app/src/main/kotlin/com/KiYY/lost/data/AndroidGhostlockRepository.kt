@@ -74,20 +74,62 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     /**
      * 探测内核当前是否已处于越狱态。
      *
-     * ⚠ 关键修复（v1.50）：**绝不能在 snapshot 加载阶段阻塞式调用 su**。
-     * 冷启动 / 开机自启时 App 尚无 root 授权，`su -c id` 会让 KSU 弹授权框或
-     * 长时间阻塞（5s 超时），导致 snapshot 永远加载不完 → kernelSnapshot == null
-     * → onRun() 被静默跳过，表现为「必须先手动越狱、拿到 root 才会自启动」。
+     * 权威判据（按优先级）：
+     *  1. **真实探测**：`su -c id` 能拿到 uid=0 → 已越狱（有 root 就等于越狱成功）
+     *  2. 本地持久化标记（离线兜底）
      *
-     * 现在改为：读 App 自己持久化的标记（零阻塞）。真实的 root 能力在
-     * 越狱执行阶段由 runExploit 内部通过 ksud 判定，不依赖这里。
+     * ⚠ 关键（v1.65）：之前只读 SharedPreferences 标记，导致「用户已在 KSU
+     * 里授权 root，但越狱状态仍显示未工作」—— 因为标记只在 exploit 成功那一刻
+     * 才写入，任何中断（杀进程、重启、授权晚于写标记）都会让它停在 false。
+     *
+     * 现在改为：先用 su 真探测（带短超时，已授权时秒回），失败再退回标记。
+     * 注意 su 探测只做「读」，不会触发 KSU 授权框（未授权时 su 会立刻失败退出）。
      */
     private fun isJailbroken(): Boolean {
-        return runCatching {
+        // 0) 内存缓存（30 秒内不重复探测，避免每次 snapshot 都起 su 进程）
+        val now = System.currentTimeMillis()
+        if (now - jailbrokenCacheAt < 30_000L) return jailbrokenCache
+
+        // 1) 权威判据：能通过 su 拿到 uid=0（短超时 1.5s，未授权时会立刻失败）
+        runCatching {
+            val process = ProcessBuilder("sh", "-c", "su -c id")
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().readText()
+            val finished = process.waitFor(1500, TimeUnit.MILLISECONDS)
+            if (finished && output.contains("uid=0")) {
+                jailbrokenCache = true
+                jailbrokenCacheAt = now
+                // 顺手把标记补上，后续离线也能显示
+                runCatching {
+                    appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
+                        .edit { putBoolean("jailbroken", true) }
+                }
+                return true
+            }
+            if (!finished) process.destroyForcibly()
+        }
+        // 2) 兜底：本地持久化标记
+        val persisted = runCatching {
             appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
                 .getBoolean("jailbroken", false)
         }.getOrDefault(false)
+        jailbrokenCache = persisted
+        jailbrokenCacheAt = now
+        return persisted
     }
+
+    /** 越狱探测缓存（30 秒有效），避免频繁起 su 进程阻塞 UI */
+    @Volatile private var jailbrokenCache = false
+    @Volatile private var jailbrokenCacheAt = 0L
+
+    /** SELinux 探测缓存（30 秒） */
+    @Volatile private var seLinuxCache = "未知"
+    @Volatile private var seLinuxCacheAt = 0L
+
+    /** Seccomp 探测缓存（30 秒） */
+    @Volatile private var seccompCache = "未知"
+    @Volatile private var seccompCacheAt = 0L
 
     /**
      * 执行一条需要 root 的命令并返回输出。
@@ -157,6 +199,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
                 .edit { putBoolean("jailbroken", true) }
         }
+        // 越狱成功后让所有探测缓存立即失效，UI 才能马上显示最新状态
+        invalidateProbeCaches()
+    }
+
+    /** 使越狱/SELinux/Seccomp 的探测缓存立即失效（下次 snapshot 强制重新探测） */
+    fun invalidateProbeCaches() {
+        jailbrokenCacheAt = 0L
+        seLinuxCacheAt = 0L
+        seccompCacheAt = 0L
     }
 
     /**
@@ -291,16 +342,45 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     /**
      * 探测 SELinux 当前模式。
      *
-     * ⚠ 同样不能在 snapshot 阶段调用 su（冷启动会阻塞/弹授权框）。
-     * 只走 framework API，App 无 root 也能拿到正确值。
+     * 实测（OnePlus Ace 6 / ColorOS / 6.6.118）：
+     *   - App 域（untrusted_app）读 `/sys/fs/selinux/enforce` → **Permission denied**
+     *   - `android.os.SELinux.isSELinuxEnforced()` → @hide，反射不可靠（曾误报 false → 宽容）
+     *   - `su -c getenforce` → `Enforcing` ✅ 最可靠（KernelSU 管理器同款做法）
+     *
+     * ⚠ 血的教训：
+     *  1. **绝不能把 framework 反射当兜底** —— 它可能返回错误的 false，把 Enforcing
+     *     显示成 Permissive（本次 bug 的根因）。
+     *  2. `su` 路径必须放在**前面**，因为 App 域读 sysfs 必然被拒。
+     *
+     * 探测顺序：su(getenforce) → su(enforce) → sysfs 直读
      */
     private fun seLinuxStatus(): String {
-        runCatching {
-            val cls = Class.forName("android.os.SELinux")
-            val enforced = cls.getMethod("isSELinuxEnforced").invoke(null) as? Boolean
-            if (enforced != null) return if (enforced) "强制模式" else "宽容模式"
+        // 0) 30 秒缓存：su 探测开销大，不必每次 snapshot 都跑
+        val now = System.currentTimeMillis()
+        if (now - seLinuxCacheAt < 30_000L) return seLinuxCache
+
+        val result = seLinuxStatusUncached()
+        seLinuxCache = result
+        seLinuxCacheAt = now
+        return result
+    }
+
+    private fun seLinuxStatusUncached(): String {
+        // 1) 首选：su + getenforce（与 KernelSU 管理器一致，最权威）
+        runSu("/system/bin/getenforce")?.let { out ->
+            when {
+                out.contains("Enforcing", ignoreCase = true) -> return "强制模式"
+                out.contains("Permissive", ignoreCase = true) -> return "宽容模式"
+            }
         }
-        // 兜底：直接读 sysfs（App 域对 /sys/fs/selinux/enforce 有读权限）
+        // 2) su 直读 sysfs
+        runSu("/system/bin/cat /sys/fs/selinux/enforce")?.let { out ->
+            when {
+                out.trim().startsWith("1") -> return "强制模式"
+                out.trim().startsWith("0") -> return "宽容模式"
+            }
+        }
+        // 3) 直属读 sysfs（App 域通常被拒，仅作最后兜底）
         runCatching {
             val v = File("/sys/fs/selinux/enforce").readText().trim()
             when {
@@ -308,20 +388,56 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 v.startsWith("0") -> return "宽容模式"
             }
         }
+        // ⚠ 不再使用 android.os.SELinux 反射 —— 它在部分 ROM 上会静默返回 false，
+        //    导致 Enforcing 被误显示为 Permissive。
         return "未知"
     }
 
     /**
-     * 探测当前进程 Seccomp 模式。
+     * 探测当前 Seccomp 模式（权威判据 = 本进程的 `Seccomp:` 字段）。
      *
-     * 关键（KSU 同款做法）：必须在**本进程**用 prctl(PR_GET_SECCOMP=21) 查询，
-     * 而不是去读 `/proc/self/status` —— 后者通过 `su -c` 读的是 su 子进程的 status，
-     * 其 Seccomp 恒为 0，于是永远误判为“未启用”。
+     * 实测（OnePlus Ace 6 / ColorOS / 6.6.118）：
+     *   - App 进程 `com.KiYY.lost`  →  `Seccomp: 2`  `Seccomp_filters: 1`  ← 过滤模式
+     *   - init (pid 1)             →  `Seccomp: 0`  ← **不能用 init 判断！**
+     *   - adb/sh 进程              →  `Seccomp: 0`  ← shell 无 filter
      *
-     * prctl 返回值：0=未启用 / 1=严格模式(STRICT) / 2=过滤模式(FILTER)
+     * ⚠ 血的教训：绝不能用 init / shell 进程的 Seccomp 值代表 App。
+     * 必须读 **App 自己进程** 的 `/proc/self/status`。
+     *
+     * 探测顺序：
+     *  1. 直接读本进程 `/proc/self/status`（App 能读自己的，通常直接成功）
+     *  2. 本进程 prctl(PR_GET_SECCOMP=21)（@hide，可能失败）
+     *  3. su 读本进程 status（兜底；用 /proc/$$ 的父进程即 App）
+     *
+     * 数值：0=未启用 / 1=严格模式 / 2=过滤模式
      */
     private fun seccompStatus(): String {
-        // 主路径：本进程 prctl
+        // 0) 30 秒缓存
+        val now = System.currentTimeMillis()
+        if (now - seccompCacheAt < 30_000L) return seccompCache
+
+        val result = seccompStatusUncached()
+        seccompCache = result
+        seccompCacheAt = now
+        return result
+    }
+
+    private fun seccompStatusUncached(): String {
+        fun parse(v: String): String? = when (v.trim()) {
+            "2" -> "过滤模式"
+            "1" -> "严格模式"
+            "0" -> "未启用"
+            else -> null
+        }
+
+        // 1) 直接读本进程（首选 —— App 读自己 /proc/self/status 是允许的）
+        runCatching {
+            val out = File("/proc/self/status").readText()
+            val line = out.lineSequence().firstOrNull { it.startsWith("Seccomp:") } ?: ""
+            parse(line.substringAfter(":"))?.let { return it }
+        }
+
+        // 2) 本进程 prctl
         runCatching {
             val cls = Class.forName("android.system.Os")
             val prctl = cls.getMethod(
@@ -329,25 +445,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 Int::class.javaPrimitiveType, Long::class.javaPrimitiveType, Long::class.javaPrimitiveType,
                 Long::class.javaPrimitiveType, Long::class.javaPrimitiveType
             )
-            when (prctl.invoke(null, 21, 0L, 0L, 0L, 0L) as? Int) {
-                1 -> return "严格模式"
-                2 -> return "过滤模式"
-                0 -> return "未启用"
-            }
+            parse((prctl.invoke(null, 21, 0L, 0L, 0L, 0L) as? Int)?.toString() ?: "")?.let { return it }
         }
-        // 兜底：直接读本进程 /proc/self/status（不经 su，读的就是自己）
-        runCatching {
-            val out = File("/proc/self/status").readText()
-            val line = out.lineSequence().firstOrNull { it.startsWith("Seccomp:") } ?: ""
-            val value = line.substringAfter(":").trim()
-            return when (value) {
-                "2" -> "过滤模式"
-                "1" -> "严格模式"
-                "0" -> "未启用"
-                else -> "Unknown"
-            }
+
+        // 3) su 兜底：显式传入 App 自己的 PID（/proc/self 在 su 里指向 su，不能用）
+        runSu("/system/bin/cat /proc/${android.os.Process.myPid()}/status")?.let { out ->
+            val line = out.lineSequence().firstOrNull { it.startsWith("Seccomp:") }
+            parse(line?.substringAfter(":") ?: "")?.let { return it }
         }
-        return "Unknown"
+        return "未知"
     }
 
     override fun selectCpuPair(index: Int) {

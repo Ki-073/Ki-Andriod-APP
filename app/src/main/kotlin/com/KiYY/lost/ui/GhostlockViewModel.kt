@@ -476,9 +476,13 @@ class GhostlockViewModel(
                 exportVisible = canExport,
                 // offsets 已存在（内置或已解析）→ boot 视为已解析
                 bootParsed = canExport,
-                // 注意：snapshot.jailbroken 只表示「su 可用」（KSU 自身 root），
-                // 不能等同 GhostLock 提权成功 —— 提权是临时的，重启后需重跑。
-                // 故此处不自动置 WORKING，越狱态只由 onRun 成功结束来设置。
+                // ⚠ 关键（v1.65）：把 snapshot.jailbroken 同步给 UI。
+                // snapshot.jailbroken 现在是**真探测**（su -c id 拿到 uid=0），
+                // 代表「KSU root 已授予」这一持久状态。
+                // UI 的「越狱状态」= workState==WORKING || jailbroken，二者取或。
+                // 这样即使用户重启了 App（workState 回 IDLE），只要 root 还在，
+                // 状态卡依然显示「工作中」，不再出现「授予了 root 却显示未工作」。
+                jailbroken = snapshot.jailbroken,
             )
         }
     }

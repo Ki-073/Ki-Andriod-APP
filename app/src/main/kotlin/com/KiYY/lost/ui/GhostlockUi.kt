@@ -86,6 +86,16 @@ data class GhostlockUiState(
     /** 越狱失败自动重试（最多 3 次） */
     val autoRetryJailbreak: Boolean = false,
     val compact: Boolean = false,
+    /**
+     * 是否已越狱（= su 可用，KSU root 已授予）。
+     *
+     * ⚠ 与 [workState] 的区别：
+     *  - [workState]  = 本次会话内的执行状态（内存态，App 重启即回 IDLE）
+     *  - [jailbroken] = 持久的根权限状态（KSU 授权 + 提权结果已固化）
+     *
+     * UI 的「越狱状态」应取二者**或**：任一为真即显示「工作中」。
+     */
+    val jailbroken: Boolean = false,
     /** SELinux 模式 */
     val seLinux: String = "-",
     /** Seccomp 状态 */
@@ -207,8 +217,14 @@ private val KsuSlideSpringSpec: androidx.compose.animation.core.SpringSpec<andro
 @Composable
 fun GhostlockApp(state: GhostlockUiState, actions: GhostlockActions) {
     GhostlockTheme {
+        // ⚠ 关键（v1.65）：越狱状态不能只看内存里的 workState。
+        // 用户可能先跑过 exploit、或直接在 KSU 里授权了 root —— 此时 workState 是
+        // IDLE，但实际已经越狱成功，UI 却显示「未工作」。正确判据 = 二者取或：
+        //   - workState == WORKING  （本次会话正在/刚完成越狱）
+        //   - state.jailbroken       （su 可用 = 已越狱）
+        val effectiveWorking = state.workState == WorkState.WORKING || state.jailbroken
         val ksuState = KsuHomeState(
-            isWorking = state.workState == WorkState.WORKING,
+            isWorking = effectiveWorking,
             workingVersion = "v${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE})",
             workingMode = "PWNED",
             uiStyle = state.uiStyle,
@@ -217,7 +233,7 @@ fun GhostlockApp(state: GhostlockUiState, actions: GhostlockActions) {
             } else {
                 "内核未适配"
             },
-            isJailbreakMode = state.workState == WorkState.WORKING,
+            isJailbreakMode = effectiveWorking,
             bootParsed = state.bootParsed,
             showUnsupportedWarning = !state.kernelSupported,
             unsupportedMessage = "当前内核不在适配表内，请先解析 boot.img 或导入 offsets.json",
@@ -236,7 +252,7 @@ fun GhostlockApp(state: GhostlockUiState, actions: GhostlockActions) {
             onAdvancedClick = { actions.onToggleAdvanced() },
             onToggleUiStyle = { actions.onToggleUiStyle() },
             // 已越狱（工作中）时禁止进入 boot 导入页：越狱后 offsets 已固化，重复解析无意义
-            onStatusCardClick = { if (state.workState != WorkState.WORKING) actions.onOpenBootPage() },
+            onStatusCardClick = { if (!effectiveWorking) actions.onOpenBootPage() },
         )
 
 // ---- 页面切换：KSU 风格弹簧转场（PagerNavigationSpringSpec）----
