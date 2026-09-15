@@ -1,0 +1,92 @@
+plugins {
+    id "com.android.application"
+    id "org.jetbrains.kotlin.plugin.compose"
+}
+
+android {
+    namespace "com.KiYY.lost"
+    compileSdk 37
+    buildToolsVersion "34.0.0"
+
+
+    defaultConfig {
+        applicationId "com.KiYY.lost"
+        minSdk 34
+        targetSdk 34
+        versionCode 55
+        versionName "1.63"
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    signingConfigs {
+        debug {
+            storeFile file("/data/user/0/cn.chengnm.mobicode/files/environment/home/.android/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+        compose true
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ["src/main/jniLibs"]
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+kotlin {
+    compilerOptions {
+        optIn.addAll(
+            "androidx.compose.material3.ExperimentalMaterial3Api",
+            "androidx.compose.material3.ExperimentalMaterial3ExpressiveApi",
+            "androidx.compose.foundation.ExperimentalFoundationApi",
+            "androidx.compose.animation.ExperimentalAnimationApi",
+            "androidx.compose.ui.ExperimentalComposeUiApi",
+        )
+    }
+}
+
+dependencies {
+    implementation platform("androidx.compose:compose-bom:2026.08.00")
+    implementation "androidx.core:core-ktx:1.12.0"
+    implementation "androidx.appcompat:appcompat:1.6.1"
+    implementation "androidx.activity:activity-compose:1.8.2"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.6.2"
+    implementation "androidx.lifecycle:lifecycle-runtime-compose:2.6.2"
+    implementation "androidx.compose.runtime:runtime"
+    implementation "androidx.compose.foundation:foundation"
+    implementation "androidx.compose.material3:material3:1.5.0-alpha27"
+    implementation "androidx.compose.material:material-icons-extended"
+    implementation "androidx.compose.ui:ui"
+    implementation "androidx.compose.ui:ui-graphics"
+    implementation "androidx.compose.ui:ui-tooling-preview"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
+}

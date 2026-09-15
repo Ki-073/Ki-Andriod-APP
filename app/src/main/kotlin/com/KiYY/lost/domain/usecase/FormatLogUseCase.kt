@@ -1,0 +1,35 @@
+package com.KiYY.lost.domain.usecase
+
+import com.KiYY.lost.domain.model.LogEntry
+import com.KiYY.lost.domain.model.LogTone
+
+class FormatLogUseCase {
+    operator fun invoke(line: String): LogEntry {
+        val text = stripAnsi(if (line.endsWith('\n')) line else "$line\n")
+        // a source tag such as [ksu] hides the marker that follows it
+        val body = text.replaceFirst(sourceTag, "")
+        val marker = body.getOrNull(1).takeIf { body.startsWith('[') && body.getOrNull(2) == ']' }
+        val message = body.replace(leadingTags, "").removePrefix("=== ")
+        val tone = when {
+            isWriteRound(message) -> if (marker == '-' || marker == '!') LogTone.Error else LogTone.Progress
+            marker == '+' -> LogTone.Success
+            marker == '-' || marker == '!' -> LogTone.Error
+            marker == '*' -> LogTone.Warning
+            body.startsWith("error", ignoreCase = true) -> LogTone.Error
+            body.startsWith("warning", ignoreCase = true) -> LogTone.Warning
+            else -> LogTone.Default
+        }
+        return LogEntry(text, tone)
+    }
+
+    private fun isWriteRound(message: String): Boolean =
+        listOf("W1", "W2", "W3", "Write 1").any(message::startsWith)
+
+    private fun stripAnsi(value: String): String = value.replace(ansi, "")
+
+    private companion object {
+        val ansi = Regex("\\u001B\\[[;\\d]*m")
+        val sourceTag = Regex("^\\[[a-z]+\\]\\s+")
+        val leadingTags = Regex("^(\\[[^]]+\\]\\s*)+")
+    }
+}
